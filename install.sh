@@ -4,97 +4,195 @@
 # Downloads only the scanner_master_cli folder and sets it up
 #
 # Usage (one-liner):
-#   curl -fsSL https://raw.githubusercontent.com/morphiens/scanner-cli-installer/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/morphiens/scanner-cli-installer/main/install.sh | bash
 #   OR (if already in directory):
-#   sudo bash install.sh
+#   bash install.sh
 #
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-SOURCE_REPO="git@github.com:morphiens/scano.git"
+SOURCE_REPO_SSH="git@github.com:morphiens/scano.git"
+SOURCE_REPO_HTTPS="https://github.com/morphiens/scano.git"
 SOURCE_REPO_BRANCH="feat/cli-setup-v5.2"
 SOURCE_SUBDIR="scripts/scanner_master_cli"
-DOWNLOAD_DIR="scanner_master_cli"
+
+# Detect actual user (not root if sudo was used)
+ACTUAL_USER="${SUDO_USER:-${USER}}"
+ACTUAL_HOME=$(eval echo "~$ACTUAL_USER")
+
+# Determine download directory: /media/scandrive if available, else ~/Downloads
+if [ -d "/media/scandrive" ] && [ -w "/media/scandrive" ]; then
+    DOWNLOAD_DIR="/media/scandrive/scanner_master_cli"
+else
+    DOWNLOAD_DIR="$ACTUAL_HOME/Downloads/scanner_master_cli"
+fi
 
 echo ""
 echo "========================================"
 echo "  Scanner CLI One-Command Installer"
 echo "========================================"
 echo ""
+echo "Download directory: $DOWNLOAD_DIR"
+echo ""
+
+# Warn if running as root
+if [ "$EUID" -eq 0 ] && [ -z "${SUDO_USER:-}" ]; then
+    echo -e "${YELLOW}⚠ Warning: Running as root. SSH keys will be created in /root/.ssh${NC}"
+    echo -e "${YELLOW}  Consider running without sudo for user-level installation${NC}"
+    echo ""
+fi
 
 # Check for git
 if ! command -v git &> /dev/null; then
-    echo -e "${RED}Error: git not found${NC}" && exit 1
+    echo -e "${RED}Error: git not found. Please install git first.${NC}" && exit 1
 fi
 
-# Function to check and initialize SSH auth
-check_ssh_auth() {
-    local ssh_key_found=false
-    local ssh_dir="$HOME/.ssh"
+# Function to check SSH auth silently (using actual user's home)
+check_ssh_auth_silent() {
+    local ssh_dir="$ACTUAL_HOME/.ssh"
+    local ssh_test_cmd
     
     # Check for existing SSH keys
-    if [ -f "$ssh_dir/id_rsa" ] || [ -f "$ssh_dir/id_ed25519" ]; then
-        ssh_key_found=true
+    if [ ! -f "$ssh_dir/id_rsa" ] && [ ! -f "$ssh_dir/id_ed25519" ]; then
+        return 1
     fi
     
-    # If no keys found, generate one
-    if [ "$ssh_key_found" = false ]; then
-        echo "No SSH keys found. Generating SSH key..."
-        mkdir -p "$ssh_dir"
-        ssh-keygen -t ed25519 -f "$ssh_dir/id_ed25519" -N "" -C "scanner-cli-installer" || {
-            echo -e "${RED}Error: Failed to generate SSH key${NC}" && exit 1
-        }
-        echo -e "${GREEN}✓${NC} SSH key generated"
+    # Test GitHub connection silently
+    if [ "$EUID" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+        ssh_test_cmd="sudo -u $SUDO_USER ssh"
+    else
+        ssh_test_cmd="ssh"
     fi
     
-    # Test GitHub connection
-    echo "Testing SSH connection to GitHub..."
-    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
-        echo -e "${GREEN}✓${NC} SSH authentication verified"
+    if $ssh_test_cmd -o ConnectTimeout=5 -o BatchMode=yes -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
         return 0
     else
-        echo -e "${YELLOW}⚠${NC} SSH key not added to GitHub. Please add the public key:"
-        if [ -f "$ssh_dir/id_ed25519.pub" ]; then
-            echo "  cat $ssh_dir/id_ed25519.pub"
-            cat "$ssh_dir/id_ed25519.pub"
-        elif [ -f "$ssh_dir/id_rsa.pub" ]; then
-            echo "  cat $ssh_dir/id_rsa.pub"
-            cat "$ssh_dir/id_rsa.pub"
-        fi
-        echo ""
-        echo "Add it at: https://github.com/settings/keys"
-        echo -e "${RED}Error: SSH authentication failed${NC}" && exit 1
+        return 1
     fi
 }
 
-# Check SSH auth
-check_ssh_auth
+# Function to set up SSH auth
+setup_ssh_auth() {
+    local ssh_dir="$ACTUAL_HOME/.ssh"
+    
+    echo "Setting up SSH authentication..."
+    
+    # Check if keys exist, if not generate one
+    if [ ! -f "$ssh_dir/id_ed25519" ] && [ ! -f "$ssh_dir/id_rsa" ]; then
+        echo "Generating SSH key..."
+        mkdir -p "$ssh_dir"
+        chmod 700 "$ssh_dir"
+        
+        # Generate key as actual user if possible
+        if [ "$EUID" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+            sudo -u "$SUDO_USER" ssh-keygen -t ed25519 -f "$ssh_dir/id_ed25519" -N "" -C "scanner-cli-installer" || {
+                echo -e "${RED}Error: Failed to generate SSH key${NC}" && exit 1
+            }
+        else
+            ssh-keygen -t ed25519 -f "$ssh_dir/id_ed25519" -N "" -C "scanner-cli-installer" || {
+                echo -e "${RED}Error: Failed to generate SSH key${NC}" && exit 1
+            }
+        fi
+        
+        echo -e "${GREEN}✓${NC} SSH key generated"
+    fi
+    
+    # Show public key
+    echo ""
+    echo "Public key to add to GitHub:"
+    echo "----------------------------------------"
+    if [ -f "$ssh_dir/id_ed25519.pub" ]; then
+        cat "$ssh_dir/id_ed25519.pub"
+    elif [ -f "$ssh_dir/id_rsa.pub" ]; then
+        cat "$ssh_dir/id_rsa.pub"
+    fi
+    echo "----------------------------------------"
+    echo ""
+    echo "Add it at: https://github.com/settings/keys"
+    echo ""
+    read -p "Press Enter after adding the key to GitHub..."
+}
+
+# Try SSH first silently
+USE_SSH=false
+SOURCE_REPO="$SOURCE_REPO_HTTPS"
+unset GIT_SSH_COMMAND
+
+if check_ssh_auth_silent; then
+    USE_SSH=true
+    SOURCE_REPO="$SOURCE_REPO_SSH"
+    export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+    echo -e "${GREEN}✓${NC} Using SSH authentication"
+else
+    echo -e "${BLUE}→${NC} Trying HTTPS authentication"
+fi
 
 # Clone repository
 echo "Cloning repository..."
 TEMP_CLONE_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_CLONE_DIR" EXIT
 
-export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no"
-if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$SOURCE_REPO_BRANCH" "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
+CLONE_SUCCESS=false
+if GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$SOURCE_REPO_BRANCH" "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
+    CLONE_SUCCESS=true
+else
+    # Try main branch
     echo -e "${YELLOW}⚠${NC} Branch '$SOURCE_REPO_BRANCH' not found, trying main branch..."
     rm -rf "$TEMP_CLONE_DIR"
     TEMP_CLONE_DIR=$(mktemp -d)
-    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch main "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
-        echo -e "${RED}Error: Failed to clone repository${NC}" && exit 1
+    if GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch main "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
+        CLONE_SUCCESS=true
+    fi
+fi
+
+# If both methods failed, ask about SSH setup
+if [ "$CLONE_SUCCESS" = false ]; then
+    echo -e "${RED}Error: Failed to clone repository${NC}"
+    
+    # If we tried HTTPS and it failed, and SSH wasn't tried or also failed
+    if [ "$USE_SSH" = false ] || ! check_ssh_auth_silent; then
+        if [ -t 0 ] && [ -t 1 ]; then
+            echo ""
+            read -p "Do you want to set up SSH authentication? (y/N): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                setup_ssh_auth
+                # Retry with SSH
+                USE_SSH=true
+                SOURCE_REPO="$SOURCE_REPO_SSH"
+                export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+                echo "Retrying clone with SSH..."
+                rm -rf "$TEMP_CLONE_DIR"
+                TEMP_CLONE_DIR=$(mktemp -d)
+                if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$SOURCE_REPO_BRANCH" "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
+                    rm -rf "$TEMP_CLONE_DIR"
+                    TEMP_CLONE_DIR=$(mktemp -d)
+                    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch main "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
+                        echo -e "${RED}Error: Failed to clone repository${NC}" && exit 1
+                    fi
+                fi
+            else
+                echo -e "${RED}Error: Cannot proceed without repository access${NC}" && exit 1
+            fi
+        else
+            echo -e "${RED}Error: Cannot proceed without repository access${NC}" && exit 1
+        fi
+    else
+        exit 1
     fi
 fi
 
 # Check if source directory exists
 SOURCE_PATH="$TEMP_CLONE_DIR/$SOURCE_SUBDIR"
 if [ ! -d "$SOURCE_PATH" ]; then
-    echo -e "${RED}Error: Source directory not found${NC}" && exit 1
+    echo -e "${RED}Error: Source directory '$SOURCE_SUBDIR' not found in repository${NC}" && exit 1
 fi
 
 # Create download directory and copy files
@@ -106,6 +204,7 @@ for file in "${FILES[@]}"; do
         echo -e "${RED}Error: $file not found in repository${NC}" && exit 1
     fi
     cp "$SOURCE_PATH/$file" "$DOWNLOAD_DIR/$file"
+    chmod +x "$DOWNLOAD_DIR/$file" 2>/dev/null || true
 done
 
 # Clean up temp clone
@@ -113,7 +212,7 @@ rm -rf "$TEMP_CLONE_DIR"
 trap - EXIT
 
 INSTALL_DIR="$(cd "$DOWNLOAD_DIR" && pwd)"
-echo -e "${GREEN}✓${NC} Files downloaded successfully"
+echo -e "${GREEN}✓${NC} Files downloaded successfully to: $INSTALL_DIR"
 echo ""
 
 # Validate installation directory
