@@ -28,8 +28,25 @@ ACTUAL_USER="${SUDO_USER:-${USER}}"
 ACTUAL_HOME=$(eval echo "~$ACTUAL_USER")
 
 # Determine download directory: /media/scandrive if available, else ~/Downloads
-if [ -d "/media/scandrive" ] && [ -w "/media/scandrive" ]; then
+# Check permissions and detect if sudo is needed
+NEED_SUDO_FOR_DIR=false
+if [ -d "/media/scandrive" ]; then
     DOWNLOAD_DIR="/media/scandrive/scanner_master_cli"
+    # Check if we can write to parent directory
+    if [ ! -w "/media/scandrive" ]; then
+        # Parent directory exists but not writable - will need sudo
+        NEED_SUDO_FOR_DIR=true
+    else
+        # Parent is writable, but check if subdirectory creation works
+        # Test by trying to create it (will clean up if successful)
+        mkdir -p "/media/scandrive/scanner_master_cli" 2>/dev/null && {
+            # Created successfully, remove test directory
+            rmdir "/media/scandrive/scanner_master_cli" 2>/dev/null || true
+        } || {
+            # Failed to create - will need sudo
+            NEED_SUDO_FOR_DIR=true
+        }
+    fi
 else
     DOWNLOAD_DIR="$ACTUAL_HOME/Downloads/scanner_master_cli"
 fi
@@ -140,21 +157,42 @@ TEMP_CLONE_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_CLONE_DIR" EXIT
 
 CLONE_SUCCESS=false
-if GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$SOURCE_REPO_BRANCH" "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
+GIT_ERROR_OUTPUT=""
+AUTH_METHOD="HTTPS"
+if [ "$USE_SSH" = true ]; then
+    AUTH_METHOD="SSH"
+fi
+
+# Try cloning with specified branch
+GIT_ERROR_OUTPUT=$(GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$SOURCE_REPO_BRANCH" "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1) && {
     CLONE_SUCCESS=true
-else
+} || {
+    # Clone failed, capture error
+    echo -e "${YELLOW}⚠${NC} Failed to clone branch '$SOURCE_REPO_BRANCH' using $AUTH_METHOD authentication"
+    echo -e "${YELLOW}Error details:${NC}"
+    echo "$GIT_ERROR_OUTPUT" | sed 's/^/  /'
+    echo ""
+    
     # Try main branch
-    echo -e "${YELLOW}⚠${NC} Branch '$SOURCE_REPO_BRANCH' not found, trying main branch..."
+    echo -e "${YELLOW}⚠${NC} Trying main branch..."
     rm -rf "$TEMP_CLONE_DIR"
     TEMP_CLONE_DIR=$(mktemp -d)
-    if GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch main "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
+    GIT_ERROR_OUTPUT=$(GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch main "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1) && {
         CLONE_SUCCESS=true
-    fi
-fi
+    } || {
+        # Main branch also failed
+        CLONE_SUCCESS=false
+    }
+}
 
 # If both methods failed, ask about SSH setup
 if [ "$CLONE_SUCCESS" = false ]; then
-    echo -e "${RED}Error: Failed to clone repository${NC}"
+    echo -e "${RED}Error: Failed to clone repository using $AUTH_METHOD authentication${NC}"
+    if [ -n "$GIT_ERROR_OUTPUT" ]; then
+        echo -e "${RED}Git error output:${NC}"
+        echo "$GIT_ERROR_OUTPUT" | sed 's/^/  /'
+        echo ""
+    fi
     
     # If we tried HTTPS and it failed, and SSH wasn't tried or also failed
     if [ "$USE_SSH" = false ] || ! check_ssh_auth_silent; then
@@ -171,20 +209,47 @@ if [ "$CLONE_SUCCESS" = false ]; then
                 echo "Retrying clone with SSH..."
                 rm -rf "$TEMP_CLONE_DIR"
                 TEMP_CLONE_DIR=$(mktemp -d)
-                if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$SOURCE_REPO_BRANCH" "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
+                
+                GIT_ERROR_OUTPUT=$(GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$SOURCE_REPO_BRANCH" "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1) && {
+                    CLONE_SUCCESS=true
+                } || {
+                    echo -e "${RED}Failed to clone branch '$SOURCE_REPO_BRANCH' with SSH${NC}"
+                    echo -e "${RED}Error details:${NC}"
+                    echo "$GIT_ERROR_OUTPUT" | sed 's/^/  /'
+                    echo ""
+                    echo -e "${YELLOW}Trying main branch with SSH...${NC}"
                     rm -rf "$TEMP_CLONE_DIR"
                     TEMP_CLONE_DIR=$(mktemp -d)
-                    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch main "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1; then
-                        echo -e "${RED}Error: Failed to clone repository${NC}" && exit 1
-                    fi
-                fi
+                    GIT_ERROR_OUTPUT=$(GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch main "$SOURCE_REPO" "$TEMP_CLONE_DIR" 2>&1) && {
+                        CLONE_SUCCESS=true
+                    } || {
+                        echo -e "${RED}Error: Failed to clone repository with SSH authentication${NC}"
+                        echo -e "${RED}Error details:${NC}"
+                        echo "$GIT_ERROR_OUTPUT" | sed 's/^/  /'
+                        echo ""
+                        echo -e "${RED}Cannot proceed without repository access${NC}"
+                        exit 1
+                    }
+                }
             else
-                echo -e "${RED}Error: Cannot proceed without repository access${NC}" && exit 1
+                echo -e "${RED}Error: Cannot proceed without repository access${NC}"
+                echo -e "${YELLOW}Possible solutions:${NC}"
+                echo "  1. Set up SSH authentication and retry"
+                echo "  2. Ensure you have access to the repository"
+                echo "  3. Check your network connection"
+                exit 1
             fi
         else
-            echo -e "${RED}Error: Cannot proceed without repository access${NC}" && exit 1
+            echo -e "${RED}Error: Cannot proceed without repository access${NC}"
+            echo -e "${YELLOW}Non-interactive mode: Cannot set up SSH authentication${NC}"
+            echo -e "${YELLOW}Possible solutions:${NC}"
+            echo "  1. Run interactively to set up SSH authentication"
+            echo "  2. Ensure HTTPS access is available"
+            echo "  3. Check your network connection"
+            exit 1
         fi
     else
+        echo -e "${RED}Error: SSH authentication was attempted but failed${NC}"
         exit 1
     fi
 fi
@@ -192,19 +257,71 @@ fi
 # Check if source directory exists
 SOURCE_PATH="$TEMP_CLONE_DIR/$SOURCE_SUBDIR"
 if [ ! -d "$SOURCE_PATH" ]; then
-    echo -e "${RED}Error: Source directory '$SOURCE_SUBDIR' not found in repository${NC}" && exit 1
+    echo -e "${RED}Error: Source directory '$SOURCE_SUBDIR' not found in repository${NC}"
+    echo -e "${YELLOW}Expected location: $SOURCE_PATH${NC}"
+    echo -e "${YELLOW}Repository was cloned to: $TEMP_CLONE_DIR${NC}"
+    echo -e "${YELLOW}Please verify the repository structure and branch${NC}"
+    exit 1
 fi
 
 # Create download directory and copy files
-mkdir -p "$DOWNLOAD_DIR"
+echo "Creating download directory: $DOWNLOAD_DIR"
+if [ "$NEED_SUDO_FOR_DIR" = true ]; then
+    if sudo -n true 2>/dev/null || [ -t 0 ]; then
+        sudo mkdir -p "$DOWNLOAD_DIR" || {
+            echo -e "${RED}Error: Failed to create directory $DOWNLOAD_DIR${NC}"
+            echo -e "${YELLOW}Permission denied. Trying without sudo...${NC}"
+            NEED_SUDO_FOR_DIR=false
+            # Fallback to user directory
+            DOWNLOAD_DIR="$ACTUAL_HOME/Downloads/scanner_master_cli"
+            mkdir -p "$DOWNLOAD_DIR" || {
+                echo -e "${RED}Error: Failed to create directory $DOWNLOAD_DIR${NC}"
+                echo -e "${YELLOW}Please check directory permissions or run with appropriate privileges${NC}"
+                exit 1
+            }
+        }
+    else
+        echo -e "${RED}Error: Directory $DOWNLOAD_DIR requires sudo but non-interactive mode${NC}"
+        echo -e "${YELLOW}Falling back to user directory...${NC}"
+        DOWNLOAD_DIR="$ACTUAL_HOME/Downloads/scanner_master_cli"
+        mkdir -p "$DOWNLOAD_DIR" || {
+            echo -e "${RED}Error: Failed to create directory $DOWNLOAD_DIR${NC}"
+            exit 1
+        }
+    fi
+else
+    mkdir -p "$DOWNLOAD_DIR" || {
+        echo -e "${RED}Error: Failed to create directory $DOWNLOAD_DIR${NC}"
+        echo -e "${YELLOW}Please check directory permissions${NC}"
+        exit 1
+    }
+fi
+
 FILES=("setup_scanner_cli.sh" "interactive_maneuver.py" "log_collector.py" "drive_uploader.py" "requirements.txt")
 
 for file in "${FILES[@]}"; do
     if [ ! -f "$SOURCE_PATH/$file" ]; then
-        echo -e "${RED}Error: $file not found in repository${NC}" && exit 1
+        echo -e "${RED}Error: $file not found in repository${NC}"
+        echo -e "${YELLOW}Expected location: $SOURCE_PATH/$file${NC}"
+        exit 1
     fi
-    cp "$SOURCE_PATH/$file" "$DOWNLOAD_DIR/$file"
-    chmod +x "$DOWNLOAD_DIR/$file" 2>/dev/null || true
+    
+    # Copy file with appropriate permissions
+    if [ "$NEED_SUDO_FOR_DIR" = true ]; then
+        sudo cp "$SOURCE_PATH/$file" "$DOWNLOAD_DIR/$file" || {
+            echo -e "${RED}Error: Failed to copy $file to $DOWNLOAD_DIR${NC}"
+            echo -e "${YELLOW}Permission denied. Check directory permissions${NC}"
+            exit 1
+        }
+        sudo chmod +x "$DOWNLOAD_DIR/$file" 2>/dev/null || true
+    else
+        cp "$SOURCE_PATH/$file" "$DOWNLOAD_DIR/$file" || {
+            echo -e "${RED}Error: Failed to copy $file to $DOWNLOAD_DIR${NC}"
+            echo -e "${YELLOW}Permission denied. You may need to run with sudo${NC}"
+            exit 1
+        }
+        chmod +x "$DOWNLOAD_DIR/$file" 2>/dev/null || true
+    fi
 done
 
 # Clean up temp clone
@@ -217,7 +334,11 @@ echo ""
 
 # Validate installation directory
 if [ ! -f "$INSTALL_DIR/setup_scanner_cli.sh" ]; then
-    echo -e "${RED}Error: setup_scanner_cli.sh not found${NC}" && exit 1
+    echo -e "${RED}Error: setup_scanner_cli.sh not found in installation directory${NC}"
+    echo -e "${YELLOW}Expected location: $INSTALL_DIR/setup_scanner_cli.sh${NC}"
+    echo -e "${YELLOW}Installation directory: $INSTALL_DIR${NC}"
+    echo -e "${YELLOW}Please verify the installation completed successfully${NC}"
+    exit 1
 fi
 
 # Check for sudo and run setup script
