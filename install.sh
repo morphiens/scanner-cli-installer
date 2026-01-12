@@ -253,7 +253,7 @@ fi
 
 # Create download directory and copy files
 mkdir -p "$DOWNLOAD_DIR"
-FILES=("setup_scanner_cli.sh" "interactive_maneuver.py" "log_collector.py" "drive_uploader.py" "requirements.txt" "m240_usb_manager.py")
+FILES=("setup_scanner_cli.sh" "interactive_maneuver.py" "log_collector.py" "drive_uploader.py" "requirements.txt")
 
 for file in "${FILES[@]}"; do
     if [ ! -f "$SOURCE_PATH/$file" ]; then
